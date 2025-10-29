@@ -1,22 +1,25 @@
-import yaml
-from pathlib import Path
-from typing import Dict, Any, List
+import io
+import json
 import os
 import re
-import json
-from pathlib import Path
-import sqlite3
-from typing import Union
-import io
-import zipfile
-import sys
 import shutil
-import textwrap
+import sqlite3
+import struct
 import subprocess
-
-import re
+import sys
+import textwrap
+import zipfile
+import hashlib
+import zlib
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Union, Optional
+from xml.etree.ElementTree import Element, SubElement, ElementTree
+import platform
+import tempfile
 
+import yaml
 
 
 OPEN_SYNTAXHIGHLIGHT_EMITSENTINEL = "<syntaxhighlight lang=\"papyrus\">"
@@ -41,364 +44,769 @@ def remap_syntaxhighlight(language: str):
     # Return the updated semiglobally defined tags
     return OPEN_SYNTAXHIGHLIGHT_EMITSENTINEL, CLOSE_SYNTAXHIGHLIGHT_EMITSENTINEL
 
-class PapyrusPygmentsMediawikiInstallationInstaller:
-    def __init__(self, syntaxhighlight_path: str):
-        self.syntaxhighlight_path = Path(syntaxhighlight_path).resolve()
-        self.pygments_path = self.syntaxhighlight_path / "pygments"
-        self.plugin_dir = self.pygments_path / "pygments_papyrus"
-        self.lexer_php = self.syntaxhighlight_path / "SyntaxHighlight.lexers.php"
-        self.entry_points_file = self.plugin_dir / "entry_points.py"
-
-    def check_environment(self):
-        """Verify that the given path looks like a MediaWiki SyntaxHighlight_GeSHi directory."""
-        if not self.pygments_path.exists():
-            raise FileNotFoundError(
-                f"Could not find pygments directory under: {self.syntaxhighlight_path}"
-            )
-        pygmentize = self.pygments_path / "pygmentize"
-        if not pygmentize.exists():
-            raise FileNotFoundError(
-                f"Could not find pygmentize binary in: {self.pygments_path}"
-            )
-        print(f"[✔] Found MediaWiki SyntaxHighlight_GeSHi at {self.syntaxhighlight_path}")
-
-    def install_plugin_code(self):
-        """Copy Papyrus plugin into the MediaWiki pygments directory."""
-        os.makedirs(self.plugin_dir, exist_ok=True)
-        plugin_code = textwrap.dedent(
-            '''
-            from pygments.lexer import RegexLexer
-            from pygments.token import Text, Name, Keyword, String, Comment, Number, Operator
-            from pygments.formatter import Formatter
-            from pygments.filter import Filter
-            from pygments.style import Style
-
-            class PapyrusLexer(RegexLexer):
-                name = "Papyrus"
-                aliases = ["papyrus", "psc"]
-                filenames = ["*.psc"]
-                tokens = {
-                    "root": [
-                        (r"\\s+", Text),
-                        (r";.*$", Comment.Single),
-                        (r"(?i)\\b(scriptname|extends|auto|property|function|event|endfunction|endevent|state|endstate)\\b", Keyword),
-                        (r"(?i)\\b(true|false|none)\\b", Keyword.Constant),
-                        (r'"[^"\\\\]*(?:\\\\.[^"\\\\]*)*"', String),
-                        (r"\\b[0-9]+\\b", Number.Integer),
-                        (r"[+\\-*/=<>!]+", Operator),
-                        (r"\\b[A-Za-z_][A-Za-z0-9_]*\\b", Name),
-                    ]
-                }
-
-            class PapyrusHTMLFormatter(Formatter):
-                def format(self, tokensource, outfile):
-                    for ttype, value in tokensource:
-                        outfile.write(value)
-
-            class PapyrusSimplifyFilter(Filter):
-                def filter(self, lexer, stream):
-                    for ttype, value in stream:
-                        yield ttype, value.replace("\\t", "<tab>")
-
-            class PapyrusStyle(Style):
-                styles = {{
-                    Comment: "italic #6a9955",
-                    Keyword: "bold #569cd6",
-                    Name: "#9cdcfe",
-                    String: "#ce9178",
-                    Number: "#b5cea8",
-                    Operator: "#d4d4d4",
-                }}
-            '''
-        )
-        (self.plugin_dir / "__init__.py").write_text(plugin_code, encoding="utf-8")
-        print(f"[✔] Installed Papyrus plugin files into {self.plugin_dir}")
-
-    def create_entry_points(self):
-        """Create registration script so bundled Pygments detects the Papyrus plugin."""
-        entry_code = textwrap.dedent(
-            """
-            from pygments.lexers import LEXERS
-            from pygments.styles import STYLE_MAP
-            from pygments.filters import FILTERS
-            from . import PapyrusLexer, PapyrusHTMLFormatter, PapyrusSimplifyFilter, PapyrusStyle
-
-            LEXERS['PapyrusLexer'] = (
-                'pygments_papyrus', 'Papyrus', ('papyrus', 'psc'),
-                ('*.psc',), ('text/x-papyrus',)
-            )
-            STYLE_MAP['papyrus-style'] = 'pygments_papyrus:PapyrusStyle'
-            FILTERS['papyrus-simplify'] = PapyrusSimplifyFilter
-            """
-        )
-        self.entry_points_file.write_text(entry_code, encoding="utf-8")
-        print(f"[✔] Created entry_points.py at {self.entry_points_file}")
-
-    def patch_lexers_php(self):
-        """Optionally add Papyrus to SyntaxHighlight.lexers.php if missing."""
-        if not self.lexer_php.exists():
-            print("[⚠] SyntaxHighlight.lexers.php not found; skipping PHP configuration.")
-            return
-
-        text = self.lexer_php.read_text(encoding="utf-8")
-        if "'papyrus'" in text:
-            print("[ℹ] Papyrus already registered in SyntaxHighlight.lexers.php.")
-            return
-
-        insertion = "    'papyrus' => 'Papyrus',\\n"
-        # crude heuristic: insert before closing bracket
-        new_text = text.replace("];", insertion + "];")
-        self.lexer_php.write_text(new_text, encoding="utf-8")
-        print(f"[✔] Added papyrus lexer entry to SyntaxHighlight.lexers.php")
-
-    def verify_installation(self):
-        """Run the bundled pygmentize binary to verify the lexer registration."""
-        pygmentize_bin = self.pygments_path / "pygmentize"
-        try:
-            result = subprocess.run(
-                [str(pygmentize_bin), "-L", "lexers"],
-                capture_output=True, text=True, check=True
-            )
-            if "papyrus" in result.stdout.lower():
-                print("[✅] Papyrus lexer registered successfully in pygmentize.")
-            else:
-                print("[❌] Papyrus not found in pygmentize output.")
-        except Exception as e:
-            print(f"[⚠] Could not verify installation: {e}")
-
-    def build_pygments_files(self, output_to_stdout=False):
-        """Build the necessary Pygments files for the Papyrus plugin."""
-        # Install plugin code
-        self.install_plugin_code()
-        # Create entry points for Pygments
-        self.create_entry_points()
-        
-        # Optionally, print the plugin files to stdout or save to the filesystem
-        if output_to_stdout:
-            plugin_code = (self.plugin_dir / "__init__.py").read_text(encoding="utf-8")
-            entry_code = self.entry_points_file.read_text(encoding="utf-8")
-            print("Papyrus Pygments Plugin Code:")
-            print(plugin_code)
-            print("\nPapyrus Entry Points Code:")
-            print(entry_code)
-        else:
-            print(f"[✔] Pygments files have been built and saved to {self.plugin_dir}")
-            print(f"[✔] Entry points created at {self.entry_points_file}")
-
-    def run(self):
-        self.check_environment()
-        self.build_pygments_files()  # Build the necessary files
-        self.patch_lexers_php()
-        self.verify_installation()
 
 
 
-import subprocess
-import yaml
+@dataclass
+class SyntaxHighlightConfig:
+    """Config for MediaWiki syntax highlighting extension and Papyrus lexer."""
+    extension: str = "SyntaxHighlight_GeSHi"
+    dir: str = "/var/www/html/extensions/SyntaxHighlight_GeSHi"
+    bundle: str = "/var/www/html/extensions/SyntaxHighlight_GeSHi/pygments/pygmentize"
+    update_lexers: str = "/var/www/html/extensions/SyntaxHighlight_GeSHi/maintenance/updateLexerList.php"
+    update_css: str = "/var/www/html/extensions/SyntaxHighlight_GeSHi/maintenance/updateCSS.php"
+    pygments_style_name: str = "papyrus"
+
+
+
+
 from pathlib import Path
-from typing import Any, Dict, Optional
-import subprocess
-import yaml
-from pathlib import Path
-from typing import Any, Dict, Optional
 import textwrap
 
 
-import subprocess
+class PapyrusLexerInjectorGenerator:
+    """
+    Generates a fully functional, self-contained Papyrus lexer injector script
+    (equivalent to papyruslexerconjecture.py) for MediaWiki's SyntaxHighlight_GeSHi.
+    """
+
+    def __init__(self, output_path: str = "papyruslexerconjecture.py"):
+        self.output_path = Path(output_path)
+
+    def generate_code(self) -> str:
+        """Return the complete injector script source as a string."""
+        return textwrap.dedent(r"""\
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
+import sys
+import zipfile
+import subprocess
+import textwrap
+import time
+import threading
+import tempfile
+import shutil
 from pathlib import Path
 
-class PapyrusDockerComposeBasicSQLLiteVersion:
+PYGMENTIZE_BUNDLE = "/var/www/html/extensions/SyntaxHighlight_GeSHi/pygments/pygmentize"
+UPDATE_LEXERS = "/var/www/html/extensions/SyntaxHighlight_GeSHi/maintenance/updateLexerList.php"
+UPDATE_CSS = "/var/www/html/extensions/SyntaxHighlight_GeSHi/maintenance/updateCSS.php"
+
+LEXER_CODE = textwrap.dedent(r'''\
+
+from pygments.lexer import RegexLexer, bygroups
+from pygments.token import Text, Comment, Keyword, Name, String, Number, Operator, Punctuation
+
+__all__ = ["PapyrusLexer"]
+
+class PapyrusLexer(RegexLexer):
+    name = "Papyrus"
+    aliases = ["papyrus", "psc"]
+    filenames = ["*.psc"]
+    mimetypes = ["text/x-papyrus"]
+
+    tokens = {
+        "root": [
+
+            (r"\s+", Text),
+            (r";.*?$", Comment.Single),
+            (r"/;.*?;/", Comment.Multiline),
+
+            (
+                r'(?i)\b(scriptname|extends|import|property|endproperty|auto|const|'
+                r'function|endfunction|event|endevent|state|endstate|struct|endstruct|'
+                r'if|elseif|else|endif|while|endwhile|return|new|as)\b',
+                Keyword
+            ),
+              
+            (r'(?i)\b(None|True|False)\b', Keyword.Constant),
+
+            (r'(?i)\b(ObjectReference|Actor|Quest|Alias|Form|Armor|Weapon|Race|'
+             r'MagicEffect|Activator|Sound|Static|GlobalVariable|ImageSpaceModifier)\b',
+             Name.Builtin),
+
+            (r"\b\d+\.\d+\b", Number.Float),
+            (r"\b\d+\b", Number.Integer),
+
+            (r'"([^"\\]|\\.)*"', String),
+
+            (r'==|!=|<=|>=|[-+/*%=<>!]', Operator),
+            (r'[()\[\]{},.:]', Punctuation),
+
+            (r'([A-Za-z_][A-Za-z0-9_]*)(:)([A-Za-z_][A-Za-z0-9_]*)',
+            bygroups(Name.Namespace, Punctuation, Name.Class)),
+
+            (r'[A-Za-z_][A-Za-z0-9_#]*', Name),
+        ]
+    }
+''')
+
+STYLE_CODE = textwrap.dedent('''\
+from pygments.style import Style
+from pygments.token import Text, Comment, Keyword, Name, String, Number, Operator, Punctuation
+
+__all__ = ["PapyrusStyle"]
+
+class PapyrusStyle(Style):
+    default_style = ""
+    background_color = "#1E1E1E"
+    styles = {
+        Text: "#DCDCDC",
+        Comment: "italic #6A9955",
+        Keyword: "bold #569CD6",
+        Keyword.Constant: "bold #D19A66",
+        Name.Builtin: "#4EC9B0",
+        Name.Namespace: "bold #9CDCFE",
+        Name.Class: "#9CDCFE",
+        Name: "#DCDCAA",
+        String: "#CE9178",
+        Number: "#B5CEA8",
+        Operator: "#D4D4D4",
+        Punctuation: "#D4D4D4",
+    }
+''')
+
+MAPPING_INSERTION = (
+    "    'PapyrusLexer': ('pygments.lexers.papyrus', 'Papyrus', "
+    "('papyrus', 'psc'), ('*.psc',), ('text/x-papyrus',)),\n"
+)
+
+def ensure_bundle_exists():
+    if not os.path.exists(PYGMENTIZE_BUNDLE):
+        sys.exit(f"[❌] Cannot find pygmentize bundle at {PYGMENTIZE_BUNDLE}")
+    print(f"[✔] Found existing pygmentize bundle.")
+
+def inject_files():
+    print("[🧩] Injecting Papyrus lexer and style into Pygments bundle...")
+    tmp = tempfile.mkdtemp(prefix="pyg_patch_")
+    with zipfile.ZipFile(PYGMENTIZE_BUNDLE, "r") as zf:
+        zf.extractall(tmp)
+
+    Path(tmp, "pygments/lexers/papyrus.py").write_text(LEXER_CODE, encoding="utf-8")
+    Path(tmp, "pygments/styles/papyrus.py").write_text(STYLE_CODE, encoding="utf-8")
+
+    with zipfile.ZipFile(PYGMENTIZE_BUNDLE, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(tmp):
+            for f in files:
+                fp = os.path.join(root, f)
+                rel = os.path.relpath(fp, tmp)
+                zf.write(fp, rel)
+    shutil.rmtree(tmp)
+    print("   → Added pygments/lexers/papyrus.py")
+    print("   → Added pygments/styles/papyrus.py")
+
+def patch_mapping():
+    print("[🧬] Patching pygments/lexers/_mapping.py to add PapyrusLexer after AutoItLexer...")
+    autoit_key = "'AutoItLexer':"
+    tmp = tempfile.mkdtemp(prefix="pyg_patch_")
+    try:
+        with zipfile.ZipFile(PYGMENTIZE_BUNDLE, "r") as zf:
+            zf.extractall(tmp)
+        mapping_path = Path(tmp, "pygments/lexers/_mapping.py")
+        data = mapping_path.read_text(encoding="utf-8")
+        if "PapyrusLexer" in data:
+            print("[ℹ️] PapyrusLexer already present; skipping patch.")
+        else:
+            if autoit_key not in data:
+                print("[⚠️] AutoItLexer entry not found — inserting at end instead.")
+                new_data = data.rstrip() + "\n" + MAPPING_INSERTION + "\n"
+            else:
+                lines = data.splitlines(keepends=True)
+                new_lines = []
+                for line in lines:
+                    new_lines.append(line)
+                    if autoit_key in line:
+                        new_lines.append(MAPPING_INSERTION)
+                new_data = "".join(new_lines)
+            mapping_path.write_text(new_data, encoding="utf-8")
+
+        # rebuild the bundle cleanly
+        with zipfile.ZipFile(PYGMENTIZE_BUNDLE, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(tmp):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    rel = os.path.relpath(fp, tmp)
+                    zf.write(fp, rel)
+        print("[✅] Successfully added PapyrusLexer to _mapping.py.")
+    except Exception as e:
+        print(f"[❌] Failed to patch mapping: {e}")
+    finally:
+        shutil.rmtree(tmp)
+
+def verify_bundle():
+    print("[🔎] Verifying Pygments bundle integrity...")
+    env = os.environ.copy()
+    # Tell Python to import from the MediaWiki pygmentize zip first (this isn't system installed!)
+    env["PYTHONPATH"] = f"/var/www/html/extensions/SyntaxHighlight_GeSHi/pygments/pygmentize:{env.get('PYTHONPATH', '')}"
+    try:
+        subprocess.run(
+            ["python3", "-m", "pygments", "-L", "lexers"],
+            env=env,
+            check=True,
+            capture_output=True,
+        )
+        print("[✅] Pygments bundle verified successfully.")
+    except subprocess.CalledProcessError as e:
+        print("[❌] Bundle verification failed:")
+        print(e.stderr.decode(errors="ignore"))
+        sys.exit(1)
+
+def reapp_bundle():
+    print("[⚙️] Rebuilding pygmentize bundle as a self-contained zipapp...")
+
+    import zipapp
+
+    tmp = tempfile.mkdtemp(prefix="pyg_repack_")
+    try:
+        # Extract current bundle to temp
+        with zipfile.ZipFile(PYGMENTIZE_BUNDLE, "r") as zf:
+            zf.extractall(tmp)
+
+        # Rebuild using zipapp to add a proper shebang
+        zipapp.create_archive(
+            source=tmp,
+            target=PYGMENTIZE_BUNDLE,
+            interpreter="/usr/bin/env python3"
+        )
+        os.chmod(PYGMENTIZE_BUNDLE, 0o755)
+
+        print("[✅] Bundle rebuilt and executable restored.")
+    except Exception as e:
+        print(f"[❌] Failed to rebuild pygmentize zipapp: {e}")
+        sys.exit(1)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_highlight_papyrus():
+
+    sample_path = "/var/www/html/extensions/SyntaxHighlight_GeSHi/Example.psc"
+    sample_code = textwrap.dedent('''\
+Scriptname Example extends Quest
+
+int property PlayerLevel auto
+string property Greeting auto
+
+Event OnInit()
+    Debug.Trace("Example script initialized!")
+    PlayerLevel = Game.GetPlayer().GetLevel()
+    if PlayerLevel > 10
+        Greeting = "Welcome back, seasoned adventurer!"
+    else
+        Greeting = "Greetings, novice hero."
+    endif
+    SayGreeting()
+EndEvent
+
+Function SayGreeting()
+    Debug.Notification(Greeting)
+EndFunction
+    ''')
+
+    Path(sample_path).write_text(sample_code, encoding="utf-8")
+    print(f"[🧪] Testing Papyrus highlighting → {sample_path}")
+    subprocess.run(
+        [
+            "python3",
+            "/var/www/html/extensions/SyntaxHighlight_GeSHi/pygments/pygmentize",
+            "-l", "papyrus",
+            "-f", "terminal256",
+            "-O", "style=papyrus",
+            sample_path,
+        ],
+        check=False,
+    )
+    subprocess.run(["python3","/var/www/html/extensions/SyntaxHighlight_GeSHi/pygments/pygmentize","-l", "autoit","-f", "terminal256", "-O", "style=default", sample_path],check=False)
+   
+    print("[✅] Papyrus highlighting test completed.\n")
+
+def regenerate_mediawiki_data():
+    print("[🧠] Triggering MediaWiki SyntaxHighlight regeneration...")
+    subprocess.run(["php", UPDATE_LEXERS], check=False)
+    env = os.environ.copy()
+    env["PYGMENTS_STYLE"] = "papyrus"
+    subprocess.run(["php", UPDATE_CSS], check=False, env=env)
+    print("[✅] MediaWiki SyntaxHighlight lexers and CSS refreshed.")
+
+def delayed_regeneration():
+    print("[⏱] Waiting 20 seconds before background re-registration...")
+    sys.stdout.flush()
+    time.sleep(20)
+    regenerate_mediawiki_data()
+    print("[✅] Background MediaWiki regeneration complete.")
+
+def main():
+    ensure_bundle_exists()
+    print("[🔍] Checking if Papyrus already injected...")
+    with zipfile.ZipFile(PYGMENTIZE_BUNDLE, "r") as zf:
+        names = zf.namelist()
+    if "pygments/lexers/papyrus.py" in names:
+        print("[ℹ️] Papyrus lexer already in bundle — patching mapping and regenerating only.")
+    else:
+        inject_files()
+    patch_mapping()
+    verify_bundle()
+    reapp_bundle()
+    regenerate_mediawiki_data()
+    test_highlight_papyrus()
+
+    try:
+        threading.Thread(target=delayed_regeneration, daemon=True).start()
+        print("[🚀] Scheduled background regeneration.")
+    except Exception as e:
+        print(f"[⚠️] Could not start delayed regeneration: {e}")
+
+if __name__ == "__main__":
+    main()
+""").lstrip()
+
+    def write(self):
+        """Write the generated script to disk."""
+        code = self.generate_code()
+        self.output_path.write_text(code, encoding="utf-8")
+        os.chmod(self.output_path, 0o755)
+        print(f"🧬 Generated Papyrus lexer injector → {self.output_path}")
+
+
+
+def ensure_dummy_png(path: str, color=(255, 255, 255, 255), size=(160, 160)):
     """
-    Generates docker-compose.yml configurations for Papyrus MediaWiki hosting,
-    with optional docgen, SSL via Caddy reverse proxy, and automatic
-    SyntaxHighlight_GeSHi + Papyrus Pygments installation and CSS generation.
+    Generate a valid PNG using only the Python standard library.
+    Produces an image of `size` (default: 160x160), filled with RGBA `color`.
+    """
+
+    path = Path(path)
+    if path.exists():
+        print(f"✔ Existing PNG found at {path}")
+        return
+
+    width, height = size
+    png_sig = b"\x89PNG\r\n\x1a\n"
+
+    # IHDR: image header chunk
+    ihdr_data = struct.pack("!2I5B", width, height, 8, 6, 0, 0, 0)
+    ihdr = b"IHDR" + ihdr_data
+    ihdr_crc = struct.pack("!I", zlib.crc32(ihdr) & 0xffffffff)
+    ihdr_chunk = struct.pack("!I", len(ihdr_data)) + ihdr + ihdr_crc
+
+    # Build raw image data: each scanline starts with filter byte 0
+    pixel = bytes(color)
+    row = b"\x00" + pixel * width
+    raw_image = row * height
+    compressed = zlib.compress(raw_image)
+
+    # IDAT: image data chunk
+    idat = b"IDAT" + compressed
+    idat_crc = struct.pack("!I", zlib.crc32(idat) & 0xffffffff)
+    idat_chunk = struct.pack("!I", len(compressed)) + idat + idat_crc
+
+    # IEND: image end chunk
+    iend = b"IEND"
+    iend_crc = struct.pack("!I", zlib.crc32(iend) & 0xffffffff)
+    iend_chunk = struct.pack("!I", 0) + iend + iend_crc
+
+    # Combine all
+    png_data = png_sig + ihdr_chunk + idat_chunk + iend_chunk
+    path.write_bytes(png_data)
+    print(f"🖼️ Generated dummy {width}x{height} PNG at {path}")
+
+class PapyrusDockerComposeUnattendedSQLDatabaseVersion:
+    """
+    Generates a docker-compose.yml for an unattended MediaWiki + MariaDB deployment,
+    with automatic Papyrus lexer injection and optional first-run import.
+
+    Drop-in replacement for PapyrusDockerComposeBasicSQLLiteVersion
+    with parameterized SQL backend, ports, syntax highlight extension, and more.
     """
 
     def __init__(
         self,
-        project_name: str = "papyrus_docs",
-        scripts_dir: str = "./Scripts",
-        output_dir: str = "./Output",
-        wiki_port: int = 8081,
-        db_enabled: bool = False,
-        auto_import: bool = True,
-        xml_filename: str = "PapyrusDocs.xml",
+        output_dir: str,
+        project_name: str = "papyrus_wiki",
+        db_image: str = "mariadb:11",
+        mw_image: str = "mediawiki:1.44",
+        mw_http_port: int = 40201,
+        db_port: int = 30433,
+        mw_dbname: str = "wikidb",
+        mw_dbuser: str = "wikiuser",
+        mw_dbpass: str = "wikipass",
+        mw_rootpass: str = "rootpass",
+        mw_admin_user: str = "papyrusdocadmin",
+        mw_admin_pass: str = "papyrusdocadminpass",
+        mw_site_name: str = "Papyrus Docs Wiki",
+        mw_site_lang: str = "en",
+        mw_server: str = "http://localhost:40201",
+        mw_extensions: List[str] = None,
+        mw_skins: List[str] = None,
+        enable_autoimport: bool = True,
+        autoimport_marker: str = ".autoimportdone",
+        syntax_config: SyntaxHighlightConfig = None,
+        python_injector_script: str = "./papyruslexerconjecture.py",
+        injector_mount_path: str = "/papyruslexerconjecture.py",
+        wiki_logo_path: str = "./wiki.png",
+        auto_import_xml: str = "./AutoFirstRunImport.xml",
+        docker_volume_name: str = "mediawiki_unattended_mariadb_data",
+        php_modules: List[str] = None,
+        sleep_time: int = 10,
+        bind_images_dir: bool = False,
+        docker_compose_version: str = "3.9",
+        verbose: bool = True,
         enable_ssl: bool = False,
-        domain: Optional[str] = None,
-        email: Optional[str] = None,
-        local_ssl: bool = False,
-        include_docgen: bool = True,
-        build_docgen: bool = False,
-        docgen_dockerfile: str = "./Dockerfile.docgen",
+        email: str = "user@example.com",
         install_syntax_highlighting: bool = False,
     ):
+
+   
+        self.output_dir = output_dir
         self.project_name = project_name
-        self.scripts_dir = Path(scripts_dir)
-        self.output_dir = Path(output_dir)
-        self.wiki_port = wiki_port
-        self.db_enabled = db_enabled
-        self.auto_import = auto_import
-        self.xml_filename = xml_filename
-        self.enable_ssl = enable_ssl
-        self.domain = domain
+        self.db_image = db_image
+        self.mw_image = mw_image
+        self.mw_http_port = mw_http_port
+        self.db_port = db_port
+        self.mw_dbname = mw_dbname
+        self.mw_dbuser = mw_dbuser
+        self.mw_dbpass = mw_dbpass
+        self.mw_rootpass = mw_rootpass
+        self.mw_admin_user = mw_admin_user
+        self.mw_admin_pass = mw_admin_pass
+        self.mw_site_name = mw_site_name
+        self.mw_site_lang = mw_site_lang
+        self.mw_server = mw_server
+        self.mw_extensions = mw_extensions or []
+        self.mw_skins = mw_skins or ["vector"]
+        self.enable_autoimport = enable_autoimport
+        self.autoimport_marker = autoimport_marker
+        self.syntax_config = syntax_config or SyntaxHighlightConfig()
+        self.python_injector_script = python_injector_script
+        self.injector_mount_path = injector_mount_path
+        self.wiki_logo_path = wiki_logo_path
+        self.auto_import_xml = auto_import_xml
+        self.docker_volume_name = docker_volume_name
+        self.php_modules = php_modules or [
+            "memory_limit=1024M",
+            "max_execution_time=0",
+        ]
+        self.sleep_time = sleep_time
+        self.bind_images_dir = bind_images_dir
+        self.docker_compose_version = docker_compose_version
+        self.verbose = verbose
         self.email = email
-        self.local_ssl = local_ssl
-        self.include_docgen = include_docgen
-        self.build_docgen = build_docgen
-        self.docgen_dockerfile = Path(docgen_dockerfile)
         self.install_syntax_highlighting = install_syntax_highlighting
+        self.enable_ssl = enable_ssl
 
-    def _mediawiki_service(self) -> Dict[str, Any]:
-        """MediaWiki service for hosting Papyrus documentation."""
-        import_cmd = ""
-        self.auto_import = False # this one doesn't assume a running MediaWiki instance
-        if self.auto_import:
-            import_cmd = (
-                f"php maintenance/importDump.php /var/www/html/imports/{self.xml_filename} && "
-                f"php maintenance/rebuildrecentchanges.php && "
+
+    # -------------------------------------------------------------------------
+    def _generate_php_config_lines(self) -> str:
+        """Render PHP configuration lines for container."""
+        lines = []
+        bOnce = False
+        for kv in self.php_modules:
+            key, value = kv.split("=", 1)
+            filename = key.replace(".", "_")
+            if not bOnce:
+                lines.append(
+                    f'echo "{key} = {value}" > /usr/local/etc/php/conf.d/{filename}.ini;'
+                )
+            else:
+                lines.append(
+                    f'    echo "{key} = {value}" > /usr/local/etc/php/conf.d/{filename}.ini;'
+                )
+            bOnce = True
+        # Use 12 spaces of indentation to match the rest of the shell block
+        return "\n            ".join(lines)
+
+
+    # -------------------------------------------------------------------------
+    def _generate_extension_loads(self) -> str:
+        """Render wfLoadExtension calls for LocalSettings.php."""
+        lines = []
+        # Always include the syntax highlighter extension first
+        lines.append(
+            f'echo "wfLoadExtension( \'\\\'\'{self.syntax_config.extension}\'\\\'\' );" >> /var/www/html/LocalSettings.php;'
+        )
+        for ext in self.mw_extensions:
+            lines.append(
+                f'echo "wfLoadExtension( \'\\\'\'{ext}\\\'\' );" >> /var/www/html/LocalSettings.php;'
             )
+        return "\n          ".join(lines)
 
-        #ext_dir = self._ensure_syntaxhighlight()
 
-        # ─── Construct service ───────────────────────────────────
-        return {
-            "image": "mediawiki",
-            "container_name": "mediawiki_papyrus",
-            "restart": "always",
-            "ports": [
-                "2450:80"
-            ],
-            "volumes": [
-                "mediawiki_papyrus:/var/www/html",  # Persist MediaWiki data
-            ],
-            "environment": {
-                "MEDIAWIKI_DB_TYPE": "sqlite",# if not self.db_enabled else "postgres",
-                "MEDIAWIKI_DB_FILE": "/var/www/html/data/wiki.sqlite",# if not self.db_enabled else "",
-                "MEDIAWIKI_SITE_NAME": "mediawiki_papyrus",
-                "MEDIAWIKI_SITE_LANG": "en",
-                "MEDIAWIKI_ADMIN_USER_NOTETAKING_UNUSED": "admin",
-                "MEDIAWIKI_ADMIN_PASS_NOTETAKING_UNUSED": "adminpass",
-            },
-            #"command": f"bash -c \"{import_cmd} apache2-foreground\"",
-        }
+    # -------------------------------------------------------------------------
+    def _generate_skin_config(self) -> str:
+        """Render skin configuration for LocalSettings.php."""
+        default_skin = self.mw_skins[0] if self.mw_skins else "vector"
+        return (
+            f'echo "\\$$wgDefaultSkin = \'"\'"\'{default_skin}\'"\'"\' ;" >> /var/www/html/LocalSettings.php;'
+        )
 
-    def generate(self, output_file: str = "docker-compose.yml"):
-        """Generate docker-compose.yml with appended instructions."""
+    def _generate_logo_config(self) -> str:
+        """Render logo configuration for LocalSettings.php."""
+        return (
+            'echo "\\$$wgLogos = [\'"\'"\'icon\'"\'"\' => \'"\'"\'$$wgScriptPath/resources/assets/wiki_custom_logo.png\'"\'"\''
+            ', \'"\'"\'1x\'"\'"\' => \'"\'"\'$$wgScriptPath/resources/assets/wiki_custom_logo.png\'"\'"\''
+            '];" >> /var/www/html/LocalSettings.php;'
+        )
+
+
+    # -------------------------------------------------------------------------
+    def generate(self) -> str:
+        """Generate the docker-compose.yml content as a string."""
+        php_conf = self._generate_php_config_lines()
+        ext_loads = self._generate_extension_loads()
+        skin_conf = self._generate_skin_config()
+        logo_conf = self._generate_logo_config()
+
+        transportServerPrepend = 'https://' if self.enable_ssl else 'http://'
+
+        autoRunXML = './AutoFirstRunImport.xml'
+
+        images_mount = (
+            "- ./images:/var/www/html/images" if self.bind_images_dir else "#- ./images:/var/www/html/images"
+        )
+
+        autoimport_block = textwrap.dedent(
+            f"""echo "Contemplating auto import";
+        if [ -s /var/www/html/AutoFirstRunImport.xml ] && [ {str(self.enable_autoimport).lower()} = true ]; then
+          echo "📦 Found AutoFirstRunImport.xml — beginning import...";
+          php maintenance/importDump.php --conf /var/www/html/LocalSettings.php --username-prefix="" /var/www/html/AutoFirstRunImport.xml;
+          echo "🔁 Rebuilding site statistics...";
+          php maintenance/initSiteStats.php --update;
+          touch {self.autoimport_marker}
+        else
+          echo "🕳️ Auto import disabled or no file found.";
+        fi;
+            """
+        ).strip()
+
+        # Re-indent it for YAML’s command block (12 spaces typical)
+        autoimport_block = textwrap.indent(autoimport_block, "            ")
+
+
+        install_syntax_highlighting_consequencestring = (
+            textwrap.dedent(f"""
+                echo "Hypothecating lexer...";
+                                  python3 {self.injector_mount_path} &
+            """).strip()
+            if self.install_syntax_highlighting else ""
+        )
+
+        install_syntax_highlighting_rereg_consequencestring = (
+            textwrap.dedent(f"""
+                echo "Reregistering lexer...";
+                                  python3 {self.injector_mount_path} --rereg &
+            """).strip()
+            if self.install_syntax_highlighting else ""
+        )
+
+        compose_text = textwrap.dedent(f"""
         
-        # The instructions to prepend
-        instructions = """# version: '3.8'
-# sqlite config!!
-# Instructions:
-# after generating this file: docker-compose up.
-# then navigate to the port in your browser (like 2450 of the 2450:80)
-# and complete the interactive installer. 
-# Make sure to install the mediawiki-extensions-SyntaxHighlight_GeSHi extension (or Extension:SyntaxHighlight, but similar relationship with pygments) should you want code highlighting.
+        services:
+          papyrusproj_{self.project_name}_mediawiki_unattended_db:
+            image: {self.db_image}
+            restart: always
+            environment:
+              MYSQL_DATABASE: {self.mw_dbname}
+              MYSQL_USER: {self.mw_dbuser}
+              MYSQL_PASSWORD: {self.mw_dbpass}
+              MYSQL_ROOT_PASSWORD: {self.mw_rootpass}
+            volumes:
+              - {self.docker_volume_name}:/var/lib/mysql
+            ports:
+              - "{self.db_port}:3306"
 
-# Make sure to think carefully about how open a wiki you want, and probably choose Vector.
-# It will give you a LocalSettings.php file to download.
-# Be sure to keep this and back the specific one up.
+          papyrusproj_{self.project_name}_mediawiki_unattended_wikiserver:
+            image: {self.mw_image}
+            restart: always
+            ports:
+              - "{self.mw_http_port}:80"
+            environment:
+              MW_DBTYPE: mysql
+              MW_DBHOST: mediawiki_unattended_db
+              MW_DBNAME: {self.mw_dbname}
+              MW_DBUSER: {self.mw_dbuser}
+              MW_DBPASS: {self.mw_dbpass}
+              MW_SITE_NAME: "{self.mw_site_name}"
+              MW_SITE_LANG: {self.mw_site_lang}
+              MW_SERVER: "{transportServerPrepend}{self.mw_server}"
+              MW_ADMIN_USER: {self.mw_admin_user}
+              MW_ADMIN_PASS: {self.mw_admin_pass}
+            volumes:
+            {images_mount}
+              - {self.python_injector_script}:{self.injector_mount_path}
+              - {self.wiki_logo_path}:/var/www/html/resources/assets/wiki_custom_logo.png
+              - {autoRunXML}:/var/www/html/AutoFirstRunImport.xml
+            command: |
+              /bin/bash -c '
+                echo "⏳ Waiting {self.sleep_time} seconds for MariaDB to settle...";
+                sleep {self.sleep_time};
+                echo "🧠 Configuring PHP settings...";
+                {php_conf}
 
-# It's important to keep your docker volume (here mediawiki_papyrus) with the same state as the LocalSettings.php that generated.
-# Mediawiki is extremely inflexible in this regard...
+                if [ ! -f /var/www/html/LocalSettings.php ]; then
+                  echo "⚙️ Running unattended MediaWiki installation...";
+                  php maintenance/run.php install \\
+                    --dbname={self.mw_dbname} \\
+                    --dbtype=mysql \\
+                    --dbserver=papyrusproj_{self.project_name}_mediawiki_unattended_db \\
+                    --dbport=3306 \\
+                    --dbuser={self.mw_dbuser} \\
+                    --dbpass={self.mw_dbpass} \\
+                    --installdbuser={self.mw_dbuser} \\
+                    --installdbpass={self.mw_dbpass} \\
+                    --server={transportServerPrepend}{self.mw_server} \\
+                    --scriptpath="" \\
+                    --lang={self.mw_site_lang} \\
+                    --pass={self.mw_admin_pass} \\
+                    "{self.mw_site_name}" {self.mw_admin_user};
 
-# then from your host system:
-# $ docker cp "LocalSettings.php" mediawiki_papyrus:/var/www/html/LocalSettings.php
-# and reopen your browser and log in
-# <syntaxhighlight lang="python" line> My code here. </syntaxhighlight> on the pages. AutoIt is somewhat similar, and if you use that it's preinstalled
+                  {install_syntax_highlighting_consequencestring}
 
-# $ docker cp ./extensions/SyntaxHighlight_GeSHi mediawiki_papyrus:/var/www/html/extensions/
+                  echo "🔌 Enabling {self.syntax_config.extension}...";
+                  {ext_loads}
 
-# $ docker cp /path/to/your/PapyrusDocs.xml mediawiki_papyrus:/var/www/html/
-# $ docker exec -it mediawiki_papyrus bash
-#>> php /var/www/html/maintenance/importDump.php /var/www/html/file.xml
+                  echo "🎨 Configuring logo...";
+                  {logo_conf}
 
-# http://localhost:2450/index.php/Special:Version will give you the installed extensions.
-# http://localhost:8081/index.php/Special:Import will allow you to import Wiki files (while logged in as admin)
-# You can import different Papyrus mod projects and mods to a custom namespace so they can coexist.
-# See: https://www.mediawiki.org/wiki/Manual:Using_custom_namespaces
-"""
+                  echo "🎨 Applying default skin...";
+                  {skin_conf}
 
-        # Create docker-compose structure
-        compose = {
-            #"version": "3.9", #deprecated in docker-compose
-            "services": {
-                "mediawiki": self._mediawiki_service(),
-            },
-            "volumes": {
-                "mediawiki_papyrus": {},
-            }
-        }
+                  {autoimport_block}
+                  {install_syntax_highlighting_rereg_consequencestring}
+                else
+                  echo "✅ LocalSettings.php already exists — skipping installation.";
+                fi;
+                exec apache2-foreground
+              '
 
-        # Combine instructions with YAML dump
-        with open(output_file, 'w', encoding="utf-8") as file:
-            file.write(instructions + "\n\n")
-            yaml.dump(compose, file, sort_keys=False)
-            
-        if self.install_syntax_highlighting:
-            print(f"Indicated install syntax highlighting but this simplified version for manual web Mediawiki (vs unattended Postgres, etc.) configuration has you do things manually.")
-            print(f"✅ Emitting pygments files (in extensions folder, as ingredient in either form of the syntax highlighting extension.)")
-            build_pygments_files(output_to_stdout=True)
-            
-            installer = PapyrusPygmentsMediawikiInstallationInstaller('./extensions')
-            installer.build_pygments_files(output_to_stdout=True)
-            
-            # formerly, in the complicated flow retired from current consideration, assuming we first git cloned the extension from the correct github version or 
-            # https://www.mediawiki.org/wiki/Special:ExtensionDistributor/SyntaxHighlight_GeSHi 
-            # installer = PapyrusPygmentsMediawikiInstallationInstaller('./extensions/SyntaxHighlight_GeSHi/pygments')
-            #print(f"✅ Installing syntax highlighting extensions.")
+        volumes:
+          {self.docker_volume_name}:
+        """).rstrip() + "\n"
 
-        print(f"✅ Generated docker-compose.yml → {output_file}")
 
-    # ───────────────────────────────────────────────
-    # HELPER FUNCTIONS FOR USER OPERATIONS
-    # ───────────────────────────────────────────────
+        if not compose_text.endswith("\r\n"):
+            compose_text += "\r\n"
 
-    def helptheuser_docker_up(self):
-        """Run 'docker-compose up' to start the container."""
-        print("Running 'docker-compose up'... This may take a while.")
-        subprocess.run(["docker-compose", "up"], check=True)
+        return compose_text
 
-    def helptheuser_docker_cp_localsettings(self, localsettings_path: str):
-        """Copy LocalSettings.php into the container."""
-        print(f"Copying LocalSettings.php to the container... {localsettings_path}")
-        subprocess.run(
-            ["docker", "cp", localsettings_path, "mediawiki_papyrus:/var/www/html/LocalSettings.php"],
-            check=True,
+    def write_ssl_service_addendum(self, compose_text: str) -> str:
+        """
+        Inject a Caddy reverse proxy SSL service into the generated docker-compose YAML,
+        append corresponding caddy volumes, and generate the Caddyfile.
+
+        Args:
+            compose_text (str): The base docker-compose YAML string.
+
+        Returns:
+            str: Modified docker-compose YAML with Caddy SSL support.
+        """
+
+        # Define the add-on YAML and volumes (aligned correctly under 'services:')
+        caddy_service = textwrap.dedent(
+            f"""
+            papyrusproj_{self.project_name}_caddy:
+                image: caddy:2
+                restart: always
+                depends_on:
+                - papyrusproj_{self.project_name}_mediawiki_unattended_wikiserver
+                ports:
+                - "80:80"
+                - "443:443"
+                volumes:
+                - ./Caddyfile:/etc/caddy/Caddyfile
+                - caddy_data:/data
+                - caddy_config:/config
+            """
+        ).rstrip()
+
+        # Inject the service block before the first top-level 'volumes:' section if it exists
+        if "\nvolumes:" in compose_text:
+            modified = compose_text.replace(
+                "\nvolumes:",
+                f"\n{caddy_service}\n\nvolumes:",
+                1
+            )
+        else:
+            # Fallback append if volumes section missing
+            modified = compose_text.rstrip() + f"\n{caddy_service}\n"
+
+        # Append the caddy volumes at the end (aligned at top-level)
+        modified = modified.rstrip() + textwrap.dedent(
+            """
+
+            caddy_data:
+            caddy_config:
+            """
         )
 
-    def helptheuser_docker_cp_syntaxhighlight_extension(self, syntaxhighlight_path: str):
-        """Copy the SyntaxHighlight_GeSHi extension into the container."""
-        print(f"Copying SyntaxHighlight_GeSHi extension to the container... {syntaxhighlight_path}")
-        subprocess.run(
-            ["docker", "cp", syntaxhighlight_path, "mediawiki_papyrus:/var/www/html/extensions/"],
-            check=True,
-        )
+        # Write the Caddyfile with appropriate TLS configuration
+        caddyfile_path = os.path.join(self.output_dir, "Caddyfile")
+        os.makedirs(self.output_dir, exist_ok=True)
 
-    def helptheuser_docker_cp_xml(self, xml_file_path: str):
-        """Copy the XML dump into the container."""
-        print(f"Copying XML file to the container... {xml_file_path}")
-        subprocess.run(
-            ["docker", "cp", xml_file_path, "mediawiki_papyrus:/var/www/html/"],
-            check=True,
-        )
+        # Choose TLS mode based on provided email
+        if getattr(self, "email", None) and "example.com" not in self.email.lower():
+            tls_line = f"tls {self.email}"
+            mode = "public ACME (Let's Encrypt)"
+        else:
+            tls_line = "tls internal"
+            mode = "local self-signed (internal CA)"
 
-    def helptheuser_docker_import_xml(self):
-        """Import the XML dump into the MediaWiki instance."""
-        print("Importing XML dump into the container...")
-        subprocess.run(
-            [
-                "docker", "exec", "-it", "mediawiki_papyrus", "bash", "-c",
-                f"php /var/www/html/maintenance/importDump.php /var/www/html/{self.xml_filename}"
-            ],
-            check=True,
-        )
+        caddyfile_content = textwrap.dedent(f"""\
+            :80 {{
+                redir https://{{{{host}}}}:443{{{{uri}}}}
+            }}
 
-    def helptheuser_browser_access(self):
-        """Instruct the user to access the MediaWiki instance in the browser."""
-        print(f"Navigate to http://localhost:{self.wiki_port} to complete the MediaWiki installation.")
+            :443 {{
+                {tls_line}
+                reverse_proxy papyrusproj_{self.project_name}_mediawiki_unattended_wikiserver:80
+            }}
+        """)
+
+        with open(caddyfile_path, "w", encoding="utf-8") as f:
+            f.write(caddyfile_content)
+
+        if self.verbose:
+            print(f"[🔐] SSL enabled ({mode}): Caddyfile written to {caddyfile_path}")
+
+        return modified
 
 
+
+
+    # -------------------------------------------------------------------------
+
+    def write(self, filename: str = "docker-compose.yml") -> str:
+        """Write the docker-compose.yml to disk."""
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        output_path = os.path.join(self.output_dir, filename)
+
+        compose_text = self.generate()
+
+        # Let SSL handler modify it if needed
+        if getattr(self, "enable_ssl", False):
+            compose_text = self.write_ssl_service_addendum(compose_text)
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(compose_text)
+
+        if self.verbose:
+            print(f"[🧱] Docker Compose written to {output_path}")
+        return output_path
+
+
+
+def ensure_auto_import_xml(output_xml_path: str, autoimport_target: str):
+    """Ensure the generated XML is duplicated or symlinked to the autoimport location."""
+    if not os.path.exists(output_xml_path):
+        print(f"[⚠️] No output XML found at {output_xml_path}; skipping autoimport copy.")
+        return
+    os.makedirs(os.path.dirname(autoimport_target), exist_ok=True)
+    if os.path.exists(autoimport_target):
+        os.remove(autoimport_target)
+    shutil.copy2(output_xml_path, autoimport_target)
+    print(f"[📦] Copied {output_xml_path} → {autoimport_target} for auto-import.")
 
 
 
@@ -504,8 +912,6 @@ KNOWN_TYPES = {
     "Explosion": "[[Explosion Script]]"
 }
 
-
-from datetime import datetime
 
 # instrument emitted articles with marker
 INCLUDE_GENERATION_MARKER = True
@@ -761,13 +1167,15 @@ class PapyrusEvent:
 
 
 class PapyrusScript:
-    def __init__(self, name: str, extends: str):
+    def __init__(self, name: str, extends: str, flags: Optional[List[str]] = None):
         self.name = name
         self.extends = extends
         self.properties: List[PapyrusProperty] = []
         self.functions: List[PapyrusFunction] = []
         self.events: List[PapyrusEvent] = []
         self.structs: List[PapyrusStruct] = []
+        self.flags: List[str] = []
+
 
     def to_mediawiki(self) -> str:
         out = [
@@ -778,7 +1186,11 @@ class PapyrusScript:
         ]
         out.append("== Definition ==")
         out.append("<syntaxhighlight lang=\"papyrus\">")
-        out.append(f"ScriptName {self.name} extends {self.extends} Native Hidden")
+        if self.flags and len(self.flags) > 0:
+            flagsListString = ' '.join(self.flags)
+            out.append(f"ScriptName {self.name} extends {self.extends} {flagsListString}")
+        else:
+            out.append(f"ScriptName {self.name} extends {self.extends}")
         #out.append("</syntaxhighlight>")
         out.append(CLOSE_SYNTAXHIGHLIGHT_EMITSENTINEL)
         out.append("")
@@ -858,7 +1270,12 @@ class SQLDocSink(DocSink):
     Accepts:
       - A connection string/path (str or Path)
       - An existing sqlite3.Connection or psycopg2 connection
+
     Automatically ensures tables exist and commits safely.
+
+    Optional batching mode:
+      enable_batch=True -> cache writes and flush in bulk
+      batch_id -> logical grouping tag (for logging or partitioning)
     """
 
     def __init__(
@@ -866,11 +1283,19 @@ class SQLDocSink(DocSink):
         conn: Union[str, Path, sqlite3.Connection],
         dialect: str = "sqlite",
         schema: Optional[str] = None,
-        autocommit: bool = True,
+        autocommit: bool = True,  # May thrash writes but prevent schema out-of-order linking problems.
+        quash_errors: bool = True,
+        enable_batch: bool = False,
+        batch_id: Optional[str] = None,
+        batch_size: int = 1000,
     ):
         self.dialect = dialect.lower()
         self.schema = schema
         self.autocommit = autocommit
+        self.quash_errors = quash_errors
+        self.enable_batch = enable_batch
+        self.batch_id = batch_id
+        self.batch_size = batch_size
 
         # --- normalize connection ---
         if isinstance(conn, (str, Path)):
@@ -888,16 +1313,37 @@ class SQLDocSink(DocSink):
         self.cur = self.conn.cursor()
         self._ensure_schema()
 
+        # --- batch buffers ---
+        self._batch_buffers = {
+            "scripts": [],
+            "functions": [],
+            "events": [],
+            "misc_pages": [],
+        }
+
+    # -------------------------------------------------------------------------
+    # SCHEMA SETUP
+    # -------------------------------------------------------------------------
 
     def _ensure_schema(self):
-        prefix = f"{self.schema}." if self.schema else ""
-        id_type = "SERIAL PRIMARY KEY" if self.dialect.startswith("post") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        """Create base tables for Papyrus documentation, in a cross-dialect-safe way."""
+        if self.dialect == "sqlite":
+            prefix = ""
+            id_type = "INTEGER PRIMARY KEY AUTOINCREMENT"
+        elif self.dialect.startswith("post"):
+            prefix = f"{self.schema}." if self.schema else ""
+            id_type = "SERIAL PRIMARY KEY"
+            # Ensure schema exists before creating tables
+            if self.schema:
+                self.cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self.schema};")
+        else:
+            raise ValueError(f"Unsupported dialect: {self.dialect}")
 
-        ddl = [
+        ddl_statements = [
             f"""
             CREATE TABLE IF NOT EXISTS {prefix}scripts (
                 id {id_type},
-                name TEXT,
+                name TEXT NOT NULL,
                 extends TEXT,
                 summary TEXT
             );
@@ -905,8 +1351,8 @@ class SQLDocSink(DocSink):
             f"""
             CREATE TABLE IF NOT EXISTS {prefix}functions (
                 id {id_type},
-                script_name TEXT,
-                name TEXT,
+                script_name TEXT NOT NULL,
+                name TEXT NOT NULL,
                 return_type TEXT,
                 params TEXT,
                 flags TEXT,
@@ -916,8 +1362,8 @@ class SQLDocSink(DocSink):
             f"""
             CREATE TABLE IF NOT EXISTS {prefix}events (
                 id {id_type},
-                script_name TEXT,
-                name TEXT,
+                script_name TEXT NOT NULL,
+                name TEXT NOT NULL,
                 params TEXT,
                 description TEXT
             );
@@ -925,25 +1371,21 @@ class SQLDocSink(DocSink):
             f"""
             CREATE TABLE IF NOT EXISTS {prefix}misc_pages (
                 id {id_type},
-                title TEXT,
+                title TEXT NOT NULL,
                 content TEXT
             );
             """,
         ]
-        for stmt in ddl:
+
+        for stmt in ddl_statements:
             self.cur.execute(stmt)
+
         if self.autocommit:
             self.conn.commit()
 
-    def write_misc(self, title: str, text: str):
-        """Insert a general-purpose wiki page or metadata."""
-        self._execute_safe(
-            "INSERT INTO misc_pages (title, content) VALUES (?, ?)"
-            if self.dialect == "sqlite"
-            else "INSERT INTO misc_pages (title, content) VALUES (%s, %s)",
-            (title, text),
-        )
-
+    # -------------------------------------------------------------------------
+    # INTERNAL EXECUTION HELPERS
+    # -------------------------------------------------------------------------
 
     def _execute_safe(self, query: str, params: tuple):
         """Execute a query and rollback if necessary."""
@@ -955,53 +1397,161 @@ class SQLDocSink(DocSink):
             self.conn.rollback()
             raise RuntimeError(f"SQLDocSink query failed: {e}") from e
 
- 
+    def _batch_append(self, table: str, row: tuple):
+        """Append a row to a batch buffer, flushing if over threshold."""
+        buf = self._batch_buffers[table]
+        buf.append(row)
+        if len(buf) >= self.batch_size:
+            self._flush_table(table)
+
+    def _flush_table(self, table: str):
+        """Flush one table’s buffer using executemany."""
+        buf = self._batch_buffers[table]
+        if not buf:
+            return
+
+        if table == "scripts":
+            query = (
+                "INSERT INTO scripts (name, extends, summary) VALUES (?, ?, ?)"
+                if self.dialect == "sqlite"
+                else "INSERT INTO scripts (name, extends, summary) VALUES (%s, %s, %s)"
+            )
+        elif table == "functions":
+            query = (
+                "INSERT INTO functions (script_name, name, return_type, params, flags, description) VALUES (?, ?, ?, ?, ?, ?)"
+                if self.dialect == "sqlite"
+                else "INSERT INTO functions (script_name, name, return_type, params, flags, description) VALUES (%s, %s, %s, %s, %s, %s)"
+            )
+        elif table == "events":
+            query = (
+                "INSERT INTO events (script_name, name, params, description) VALUES (?, ?, ?, ?)"
+                if self.dialect == "sqlite"
+                else "INSERT INTO events (script_name, name, params, description) VALUES (%s, %s, %s, %s)"
+            )
+        elif table == "misc_pages":
+            query = (
+                "INSERT INTO misc_pages (title, content) VALUES (?, ?)"
+                if self.dialect == "sqlite"
+                else "INSERT INTO misc_pages (title, content) VALUES (%s, %s)"
+            )
+        else:
+            raise ValueError(f"Unknown table for batch flush: {table}")
+
+        try:
+            self.cur.executemany(query, buf)
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            raise RuntimeError(f"SQLDocSink batch flush failed for {table}: {e}") from e
+        finally:
+            buf.clear()
+
+    def flush_all(self):
+        """Flush all pending batch buffers."""
+        for table in self._batch_buffers.keys():
+            self._flush_table(table)
+
+    # -------------------------------------------------------------------------
+    # PUBLIC WRITE METHODS
+    # -------------------------------------------------------------------------
+
+    def write_misc(self, title: str, text: str):
+        row = (title, text)
+        if self.enable_batch:
+            self._batch_append("misc_pages", row)
+        else:
+            self._execute_safe(
+                "INSERT INTO misc_pages (title, content) VALUES (?, ?)"
+                if self.dialect == "sqlite"
+                else "INSERT INTO misc_pages (title, content) VALUES (%s, %s)",
+                row,
+            )
+
     def write_script(self, script: "PapyrusScript"):
-        self._execute_safe(
-            "INSERT INTO scripts (name, extends, summary) VALUES (?, ?, ?)"
-            if self.dialect == "sqlite"
-            else "INSERT INTO scripts (name, extends, summary) VALUES (%s, %s, %s)",
-            (script.name, script.extends, f"{len(script.functions)} funcs, {len(script.events)} events"),
+        row = (
+            script.name,
+            script.extends,
+            f"{len(script.functions)} funcs, {len(script.events)} events",
         )
+        if self.enable_batch:
+            self._batch_append("scripts", row)
+        else:
+            self._execute_safe(
+                "INSERT INTO scripts (name, extends, summary) VALUES (?, ?, ?)"
+                if self.dialect == "sqlite"
+                else "INSERT INTO scripts (name, extends, summary) VALUES (%s, %s, %s)",
+                row,
+            )
 
     def write_function(self, script_name: str, fn: "PapyrusFunction"):
-        self._execute_safe(
-            "INSERT INTO functions (script_name, name, return_type, params, flags, description) VALUES (?, ?, ?, ?, ?, ?)"
-            if self.dialect == "sqlite"
-            else "INSERT INTO functions (script_name, name, return_type, params, flags, description) VALUES (%s, %s, %s, %s, %s, %s)",
-            (script_name, fn.name, fn.return_type, fn.params, fn.flags, fn.description),
+        row = (
+            script_name,
+            fn.name,
+            fn.return_type,
+            fn.params,
+            fn.flags,
+            fn.description,
         )
+        if self.enable_batch:
+            self._batch_append("functions", row)
+        else:
+            self._execute_safe(
+                "INSERT INTO functions (script_name, name, return_type, params, flags, description) VALUES (?, ?, ?, ?, ?, ?)"
+                if self.dialect == "sqlite"
+                else "INSERT INTO functions (script_name, name, return_type, params, flags, description) VALUES (%s, %s, %s, %s, %s, %s)",
+                row,
+            )
 
     def write_event(self, script_name: str, ev: "PapyrusEvent"):
-        self._execute_safe(
-            "INSERT INTO events (script_name, name, params, description) VALUES (?, ?, ?, ?)"
-            if self.dialect == "sqlite"
-            else "INSERT INTO events (script_name, name, params, description) VALUES (%s, %s, %s, %s)",
-            (script_name, ev.name, ev.params, ev.description),
-        )
+        row = (script_name, ev.name, ev.params, ev.description)
+        if self.enable_batch:
+            self._batch_append("events", row)
+        else:
+            self._execute_safe(
+                "INSERT INTO events (script_name, name, params, description) VALUES (?, ?, ?, ?)"
+                if self.dialect == "sqlite"
+                else "INSERT INTO events (script_name, name, params, description) VALUES (%s, %s, %s, %s)",
+                row,
+            )
 
-  
+    # -------------------------------------------------------------------------
+    # FINALIZATION
+    # -------------------------------------------------------------------------
+
     def finalize(self):
+        """Safely flush, commit, and close all SQL resources."""
+        commit_err = None
+
         try:
+            if self.enable_batch:
+                self.flush_all()
             self.conn.commit()
-        except Exception:
-            pass
-        finally:
-            try:
+        except Exception as e:
+            commit_err = e
+            if not self.quash_errors:
+                raise RuntimeError(f"Finalize failed during commit: {e}") from e
+
+        try:
+            if self.cur:
                 self.cur.close()
-            except Exception:
-                pass
-            try:
+        except Exception as e:
+            if not self.quash_errors:
+                raise RuntimeError(f"Finalize failed while closing cursor: {e}") from e
+
+        try:
+            if self.conn:
                 self.conn.close()
-            except Exception:
-                pass
+        except Exception as e:
+            if not self.quash_errors:
+                raise RuntimeError(f"Finalize failed while closing connection: {e}") from e
+
+        if commit_err and self.quash_errors:
+            import sys
+            print(f"[SQLDocSink] Warning: commit failed during finalize: {commit_err}", file=sys.stderr)
 
 
-import io
-import zipfile
-import hashlib
-from datetime import datetime
-from xml.etree.ElementTree import Element, SubElement, ElementTree
+
+
 
 class ArchiveDocSink(DocSink):
     """
@@ -1143,12 +1693,16 @@ class ArchiveDocSink(DocSink):
 
 
 
-
-
-
 class PapyrusParser:
     # Updated regex pattern to handle namespaces and colons in the script name and extends
-    SCRIPT_PATTERN = re.compile(r"ScriptName\s+(?P<name>[A-Za-z0-9_:#]+)(\s+extends\s+(?P<extends>[A-Za-z0-9_:#]+))?", re.IGNORECASE)
+    # old trusty version without flags
+    # SCRIPT_PATTERN = re.compile(r"ScriptName\s+(?P<name>[A-Za-z0-9_:#]+)(\s+extends\s+(?P<extends>[A-Za-z0-9_:#]+))?", re.IGNORECASE)
+    SCRIPT_PATTERN = re.compile(
+        r"ScriptName\s+(?P<name>[A-Za-z0-9_:#]+)"
+        r"(?:\s+extends\s+(?P<extends>[A-Za-z0-9_:#]+))?"
+        r"(?:\s+(?P<flags>(?:native|hidden|sealed|conditional|global|abstract|final|\s+)*))?",
+        re.IGNORECASE,
+    )
     FUNC_PATTERN = re.compile(r"(?P<ret>\w+)\s+Function\s+(?P<name>\w+)\((?P<params>[^)]*)\)(?P<flags>.*)", re.IGNORECASE)
     EVENT_PATTERN = re.compile(r"Event\s+(?P<name>\w+)\((?P<params>[^)]*)\)", re.IGNORECASE)
     PROP_PATTERN = re.compile(r"(?P<type>\w+)\s+Property\s+(?P<name>\w+)\s+(?P<flags>auto|autoReadOnly|const)?", re.IGNORECASE)
@@ -1169,7 +1723,9 @@ class PapyrusParser:
             if m := self.SCRIPT_PATTERN.search(line):
                 script_name = m.group("name")  # Use group() to access the matched group
                 extends = m.group("extends") if m.group("extends") else ""  # Use group() and fallback to "" if extends is not found
-                script = PapyrusScript(script_name, extends)
+                flags = m.group("flags") or ""
+                flags_list = [f.strip().capitalize() for f in flags.split() if f.strip()] # we don't *need* to case normalize
+                script = PapyrusScript(script_name, extends, flags=flags_list)
                 continue
             if not script:
                 continue
@@ -1560,17 +2116,13 @@ def generate_index(
         print(f"✅ Wrote index page with sidebar → {out_path}")
 
 
-
-
-
 class PapyrusForeignDecompilerAutomation:
     """
-    Scans a directory for .pex files and attempts to decompile them
-    into .psc files using any compatible decompiler executable.
-
-    The tool detects whether it must use Wine/Proton or can run natively,
-    depending on platform and the binary type. It runs only when
-    --preproc-foreign-decompiler is explicitly provided.
+    Updated impl of the Papyrus .pex → .psc automation.
+    - Validates paths
+    - Supports Wine, Bottles, and Proton (with 'proton run')
+    - Prevents accidental overwrites
+    - Adds timeouts, sandboxing, and clean environment
     """
 
     def __init__(
@@ -1579,124 +2131,180 @@ class PapyrusForeignDecompilerAutomation:
         force: bool = False,
         runner_hint: Optional[str] = None,
         env: Optional[dict] = None,
+        timeout: int = 60,
+        base_dir: Optional[str] = None,
+        sandbox: bool = True,
     ):
         """
-        :param decompiler_path: Path to the decompiler executable (any tool).
+        :param decompiler_path: Path to the decompiler executable.
         :param force: Re-decompile even if PSC is newer than PEX.
-        :param runner_hint: Optional command (e.g. "wine", "proton", "bottles-cli run").
-        :param env: Optional environment variables to inject (e.g. WINEPREFIX).
+        :param runner_hint: e.g. "wine", "wine64", "bottles-cli run", or "proton".
+        :param env: Optional environment vars to merge into safe environment.
+        :param timeout: Kill subprocess after N seconds.
+        :param base_dir: Restrict file I/O to this directory.
+        :param sandbox: Use firejail (if available) for filesystem isolation.
         """
         self.decompiler_path = Path(decompiler_path).resolve()
         self.force = force
-        self.env = os.environ.copy()
-        if env:
-            self.env.update(env)
+        self.timeout = timeout
+        self.base_dir = Path(base_dir or os.getcwd()).resolve()
+        self.env = self._make_safe_env(env)
         self.runner_hint = runner_hint
         self.is_windows = platform.system().lower().startswith("win")
+        self.sandbox = sandbox
         self.runner = self._detect_runner()
 
+        if not self.decompiler_path.exists():
+            raise FileNotFoundError(f"Decompiler not found: {self.decompiler_path}")
 
+        print(f"🧱 Using decompiler: {self.decompiler_path}")
+        print(f"🔒 Sandbox: {'on' if self.sandbox else 'off'} | Timeout: {self.timeout}s")
+
+    # ---------------------------------------------------------------------- #
+    #  Environment and runner detection
+    # ---------------------------------------------------------------------- #
+    def _make_safe_env(self, user_env: Optional[dict]) -> dict:
+        safe_env = {
+            "PATH": os.getenv("PATH", ""),
+            "HOME": os.getenv("HOME", "/tmp"),
+            "LANG": os.getenv("LANG", "C.UTF-8"),
+        }
+        if user_env:
+            safe_env.update(user_env)
+        return safe_env
 
     def _detect_runner(self) -> Optional[List[str]]:
-        """Determine how to execute the decompiler (native vs compatibility layer)."""
+        """Detect execution environment (native, wine, proton, bottles)."""
         if self.is_windows:
-            return None  # run directly
+            return None
 
-        # If user specified a runner (e.g. proton, wine64, bottles)
+        # explicit user hint
         if self.runner_hint:
             parts = self.runner_hint.split()
             if shutil.which(parts[0]):
                 return parts
-            print(f"⚠️ Runner '{self.runner_hint}' not found in PATH.")
-            return None
+            raise RuntimeError(f"Runner '{self.runner_hint}' not found in PATH.")
 
-        # Otherwise, auto-detect based on binary type
-        if not self.decompiler_path.exists():
-            print(f"❌ Decompiler binary not found: {self.decompiler_path}")
-            return None
+        # auto-detect
+        for candidate in ("wine64", "wine", "bottles-cli", "proton"):
+            if shutil.which(candidate):
+                print(f"🔧 Found runner: {candidate}")
+                return [candidate]
+        return None
 
+    # ---------------------------------------------------------------------- #
+    #  Utility and validation helpers
+    # ---------------------------------------------------------------------- #
+    def _within_base_dir(self, path: Path) -> bool:
         try:
-            result = subprocess.run(
-                ["file", "-b", str(self.decompiler_path)],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            desc = result.stdout.lower()
-            if "pe32" in desc or "pe64" in desc:
-                # Windows binary — try Wine or Proton
-                for candidate in ("wine64", "wine", "proton", "bottles-cli"):
-                    if shutil.which(candidate):
-                        print(f"🔧 Detected Windows binary — using {candidate}")
-                        return [candidate]
-                print("⚠️  No compatible runner (Wine/Proton) found for Windows binary.")
-                return None
-            else:
-                # Native binary, run directly
-                return None
+            return self.base_dir in path.resolve().parents
         except Exception:
-            # Fallback: try Wine if exists
-            if shutil.which("wine"):
-                return ["wine"]
-            return None
+            return False
 
     def _should_skip(self, pex: Path, psc: Path) -> bool:
-        """Skip re-decompiling if PSC exists and is newer (unless force=True)."""
         if self.force:
             return False
         return psc.exists() and psc.stat().st_mtime > pex.stat().st_mtime
 
+    # ---------------------------------------------------------------------- #
+    #  Command builder
+    # ---------------------------------------------------------------------- #
+    def _build_command(self, pex: Path) -> List[str]:
+        exe = str(self.decompiler_path)
+        args = [exe, str(pex)]
 
+        if not self.runner:
+            return args
 
+        runner = self.runner[0]
+
+        if runner == "proton":
+            # Proton needs "proton run ..."
+            compat_dir = os.path.join(tempfile.gettempdir(), "proton-sandbox")
+            os.makedirs(compat_dir, exist_ok=True)
+            self.env.setdefault("STEAM_COMPAT_DATA_PATH", compat_dir)
+            return ["proton", "run"] + args
+        elif runner == "bottles-cli":
+            return ["bottles-cli", "run", exe, str(pex)]
+        else:
+            # e.g. wine, wine64
+            return [runner, exe, str(pex)]
+
+    # ---------------------------------------------------------------------- #
+    #  Decompile one file
+    # ---------------------------------------------------------------------- #
     def _decompile_one(self, pex: Path) -> Optional[Path]:
-        """Run the configured decompiler on a single .pex file."""
-        if not self.decompiler_path.exists():
-            print(f"❌ Decompiler not found: {self.decompiler_path}")
+        if not self._within_base_dir(pex):
+            print(f"⚠️ Skipping {pex}: outside base directory")
             return None
 
         expected_psc = pex.with_suffix(".psc")
         if self._should_skip(pex, expected_psc):
-            print(f"⏩ Skipping {pex.name} (already decompiled and up-to-date)")
+            print(f"⏩ Skipping {pex.name} (already decompiled)")
             return expected_psc
 
         print(f"🧩 Decompiling {pex.name}...")
 
-        # Build command
-        if self.runner:
-            cmd = [*self.runner, str(self.decompiler_path), str(pex)]
-        else:
-            cmd = [str(self.decompiler_path), str(pex)]
+        cmd = self._build_command(pex)
+
+        # firejail sandbox if available
+        if self.sandbox and shutil.which("firejail"):
+            cmd = ["firejail", "--quiet", "--private=" + str(self.base_dir)] + cmd
+
+        temp_psc = expected_psc.with_suffix(".psc.tmp")
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, env=self.env)
-            if result.stdout.strip():
-                print(result.stdout.strip())
-        except subprocess.CalledProcessError as e:
-            print(f"⚠️  Failed to decompile {pex.name}: {e.stderr.strip() or e.stdout.strip()}")
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=self.env,
+                timeout=self.timeout,
+                check=False,
+                cwd=str(self.base_dir),
+            )
+        except subprocess.TimeoutExpired:
+            print(f"⏰ Timeout while decompiling {pex.name}")
+            return None
+        except Exception as e:
+            print(f"❌ Execution failed for {pex.name}: {e}")
             return None
 
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            print(f"⚠️ Decompiler error ({pex.name}): {stderr or stdout}")
+            return None
+
+        # Check for result file
         if expected_psc.exists():
             print(f"✅ Decompiled → {expected_psc}")
             return expected_psc
+        elif temp_psc.exists():
+            temp_psc.rename(expected_psc)
+            print(f"✅ Moved temp output → {expected_psc}")
+            return expected_psc
         else:
-            print(f"⚠️  Expected output not found: {expected_psc}")
+            print(f"⚠️ Expected output missing: {expected_psc}")
             return None
 
-
-
+    # ---------------------------------------------------------------------- #
+    #  File discovery and execution
+    # ---------------------------------------------------------------------- #
     def find_pex_files(self, directory: str) -> List[Path]:
-        """Recursively locate all .pex files."""
-        return sorted(Path(directory).rglob("*.pex"))
+        root = Path(directory).resolve()
+        if not self._within_base_dir(root):
+            raise PermissionError(f"{root} is outside base dir {self.base_dir}")
+        return sorted(root.rglob("*.pex"))
 
     def run(self, directory: str) -> List[Path]:
-        """Decompile all .pex files in a directory tree."""
-        print(f"🔍 Searching for .pex files under: {directory}")
+        print(f"🔍 Searching for .pex files under {directory}")
         pex_files = self.find_pex_files(directory)
         if not pex_files:
-            print("ℹ️  No .pex files found.")
+            print("ℹ️ No .pex files found.")
             return []
 
-        generated: List[Path] = []
+        generated = []
         for pex in pex_files:
             psc = self._decompile_one(pex)
             if psc:
@@ -1706,13 +2314,11 @@ class PapyrusForeignDecompilerAutomation:
         return generated
 
 
+
 if __name__ == "__main__":
     import argparse
-    import sys
     import traceback
-    from pathlib import Path
-    from datetime import datetime
-
+ 
     print("🔧 ReedPapyri — Papyrus Documentation & Wiki Toolchain")
 
     ap = argparse.ArgumentParser(
@@ -1744,14 +2350,13 @@ if __name__ == "__main__":
 
     ap.add_argument("--docker", action="store_true", help="Generate docker-compose.yml for hosting docs")
     ap.add_argument("--ssl", action="store_true", help="Enable HTTPS with Caddy")
-    ap.add_argument("--domain", help="Domain for HTTPS setup (required if --ssl is used)")
+    ap.add_argument("--domain", help="Domain for HTTPS setup (required if --ssl is used)", default="localhost",)
     ap.add_argument("--email", help="Email for Let's Encrypt SSL")
-    ap.add_argument("--local-ssl", action="store_true", help="Use local/internal certs")
+    #ap.add_argument("--local-ssl", action="store_true", help="Use local/internal certs")
     ap.add_argument("--db", action="store_true", help="Include database container in docker-compose")
-    ap.add_argument("--no-docgen", dest="include_docgen", action="store_false", help="Skip docgen container")
-    ap.add_argument("--build-docgen", action="store_true", help="Build docgen from Dockerfile.docgen")
 
     ap.add_argument("--wiki-user", default="ReedPapyri", help="Contributor username for XML exports")
+    ap.add_argument("--wiki-name", default="Papyrus Docs Wiki", help="Wiki name that appears to users in search box")
     ap.add_argument("--wiki-base", default="http://papyruswiki.localhost/wiki/Main_Page",
                     help="Base URL for the MediaWiki site in XML exports")
     ap.add_argument("--install-syntax-highlighting", action="store_true",
@@ -1770,7 +2375,7 @@ if __name__ == "__main__":
     help="Truncate generation marker timestamps to minutes (less noisy diffs)",
     )
     
-    # Add this to your argument parser
+
     ap.add_argument(
         "--syntax-language",
         help="Specify the language for syntax highlighting (e.g., 'papyrus', 'AutoIt', 'pascal').",
@@ -1810,6 +2415,47 @@ if __name__ == "__main__":
         help="Select the parser to use: 'regular' (default) or 'pyparsing'."
     )
 
+    ap.add_argument(
+        "--no-autoimport-copy",
+        action="store_true",
+        help="Skip copying the generated XML to AutoFirstRunImport.xml for Docker auto-import."
+    )
+
+    ap.add_argument(
+    "--init-wikibuildcontext",
+    action="store_true",
+    help="Generate missing wiki build context files (papyruslexerconjecture.py and wiki.png) in the output directory after Docker warnings.",
+    )
+
+    ap.add_argument(
+        "--dockerport-randomize",
+        action="store_true",
+        help="Randomize MediaWiki and database host ports to help avoid collisions when running multiple wikis."
+    )
+    ap.add_argument(
+        "--dockerport-portmw",
+        type=int,
+        default=40201,
+        help="Host port to expose the MediaWiki HTTP service (default: 40201)."
+    )
+    ap.add_argument(
+        "--dockerport-portdb",
+        type=int,
+        default=30433,
+        help="Host port to expose the MariaDB service (default: 30433)."
+    )
+
+    ap.add_argument("--sqlsink-enable-batch", action="store_true", help="Enable batch write mode.")
+    ap.add_argument("--sqlsink-batch-id", type=str, help="Logical batch ID for this run.")
+    ap.add_argument("--sqlsink-batch-size", type=int, default=500, help="Flush size for batched writes.")
+
+    ap.add_argument(
+        "--docker-wikilogo",
+        type=str,
+        help="Path to a custom PNG logo for the Docker MediaWiki build. "
+            "If omitted, a default dummy logo will be used."
+    )
+
     args = ap.parse_args()
     
     # Get the selected parser choice from the arguments
@@ -1825,7 +2471,6 @@ if __name__ == "__main__":
 
     # Apply the specified language for syntax highlighting
     remap_syntaxhighlight(highlighting_language)
-
     
     if args.no_marker:
         INCLUDE_GENERATION_MARKER = False
@@ -1875,13 +2520,28 @@ if __name__ == "__main__":
         elif args.mode == "zip":
             sink = ArchiveDocSink(mode="zip")
         elif args.mode == "sql":
-            sink = SQLDocSink(args.db_conn, dialect=args.db_dialect)
-            # Test connection
+            # Initialize the SQL sink with batching options from CLI.
+            # Note: when batching is enabled we disable autocommit for efficiency.
+            sink = SQLDocSink(
+                conn=args.db_conn,
+                dialect=args.db_dialect,
+                autocommit=not args.sqlsink_enable_batch,
+                enable_batch=args.sqlsink_enable_batch,
+                batch_id=args.sqlsink_batch_id,
+                batch_size=args.sqlsink_batch_size,
+            )
+
+            # Basic connection sanity check.
             try:
                 sink.cur.execute("SELECT 1;")
                 sink.conn.commit()
             except Exception as e:
-                sys.exit(f"❌ Database connection test failed: {e}")
+                # Close resources before exiting to avoid leaking handles.
+                try:
+                    sink.finalize()
+                except Exception:
+                    pass
+                sys.exit(f"❌ Database connection test failed: {type(e).__name__}: {e}")
     except Exception as e:
         traceback.print_exc()
         sys.exit(f"❌ Failed to initialize output sink: {e}")
@@ -1929,6 +2589,7 @@ if __name__ == "__main__":
 
 
     # This section writes the output based on the sink type (XML, SQL, etc.)
+    archive_name = 'PapyrusRef'
     if isinstance(sink, ArchiveDocSink):
         # Force the name to be PapyrusDocs.xml for Docker
         if args.docker:
@@ -1956,7 +2617,6 @@ if __name__ == "__main__":
         print("  - MediaWiki (MediaWiki base image)")
         print("  - Caddy (reverse proxy and SSL automation)")
         print("  - pygmentize (syntax highlighting binary)")
-        print("  - SyntaxHighlight(_GeSHi) (MediaWiki syntax plugin)")
         print("")
         print("These components are downloaded from external sources and may execute third-party code.")
         print("They could be subject to supply chain vulnerabilities or version changes.")
@@ -1968,21 +2628,144 @@ if __name__ == "__main__":
             print("❌ Operation cancelled by user for safety.")
         else:
             try:
+
+
+                xml_path = output_file #os.path.join(output_dir, "PapyrusDocs.xml")
+                auto_import_xml = output_dir / "AutoFirstRunImport.xml"
+
+
+                if not args.no_autoimport_copy:
+                    ensure_auto_import_xml(xml_path, auto_import_xml)
+
                 if args.ssl and not args.domain:
                     print("⚠️ SSL requested but no domain provided — skipping Caddy setup.")
-                PapyrusDockerComposeBasicSQLLiteVersion(
+
+                if not args.domain:
+                    args.domain = 'localhost'
+
+                autoisolate_volprefix_base_name = args.project_name or "pscproj"
+                #autoisolate_volprefix_base_name = os.path.basename(os.path.abspath(args.out)) or "pscproj"
+                autoisolate_volprefix_volume_name = f"papyrus_{autoisolate_volprefix_base_name}_db_data"
+
+
+                # Handle port randomization or overrides
+                if args.dockerport_randomize:
+                    import random
+                    # Add a random offset in a reasonable range (so they don’t collide)
+                    offset = random.randint(0, 499)
+                    mw_port = args.dockerport_portmw + offset
+                    db_port = args.dockerport_portdb + offset
+                    print(f"🎲 Randomizing Docker ports → MediaWiki:{mw_port}  MariaDB:{db_port}")
+                else:
+                    mw_port = args.dockerport_portmw
+                    db_port = args.dockerport_portdb
+
+                docker_gen = PapyrusDockerComposeUnattendedSQLDatabaseVersion(
                     project_name=args.project_name,
                     output_dir=args.out,
                     enable_ssl=args.ssl,
-                    domain=args.domain,
+                    mw_server= args.domain+":"+str(mw_port) if args.domain == 'localhost' else args.domain,
                     email=args.email,
-                    db_enabled=args.db,
-                    local_ssl=args.local_ssl,
-                    include_docgen=args.include_docgen,
-                    build_docgen=args.build_docgen,
+                    #local_ssl=args.local_ssl,
                     install_syntax_highlighting=args.install_syntax_highlighting,
-                ).generate()
-                print(f"🐳 Docker environment generated for {args.project_name}")
+                    auto_import_xml=auto_import_xml,
+                    docker_volume_name=autoisolate_volprefix_volume_name,
+                    db_port=db_port,
+                    mw_http_port=mw_port,
+                    mw_site_name=args.wiki_name
+                ).write()
+
+
+
+                missing = []
+                expected_files = {
+                    "Papyrus lexer injector": Path("papyruslexerconjecture.py"),
+                    "Wiki logo": Path(output_dir) / "wiki.png",
+                    "Auto import XML": auto_import_xml,
+                }
+
+                for label, path in expected_files.items():
+                    if not path.exists():
+                        missing.append(f"  - {label}: {path}")
+
+                if missing:
+                    print("⚠️  WARNING: The following required files are missing in this directory:")
+                    for item in missing:
+                        print(item)
+                    print("")
+                    print("Docker will still run, but the wiki may not build or render properly.")
+                    print("You can pass --init-wikibuildcontext to generate stub assets.")
+                    print("Ensure the files above exist relative to the compose file before running:")
+                    print("   docker compose up")
+                    print("")
+
+
+                if args.init_wikibuildcontext:
+                    print("🧩 Initializing wiki build context...")
+
+                    try:
+                        injector_path = Path(output_dir) / "papyruslexerconjecture.py"
+                        if not injector_path.exists():
+                            print(f"⚙️ Generating Papyrus lexer injector → {injector_path}")
+                            
+                            # ✅ instantiate the class properly
+                            injector = PapyrusLexerInjectorGenerator(injector_path)
+                            injector.write()
+                            
+                            print(f"✅ Wrote {injector_path}")
+                        else:
+                            print(f"✔ Lexer injector already exists at {injector_path}")
+                    except Exception as e:
+                        print(f"⚠️ Failed to generate injector: {e}")
+
+
+                    # 2. Handle wiki logo
+                    try:
+                        wiki_png_path = Path(output_dir) / "wiki.png"
+
+                        if args.docker_wikilogo and Path(args.docker_wikilogo).is_file():
+                            try:
+                                with open(args.docker_wikilogo, "rb") as f:
+                                    magic = f.read(8)
+                                if magic == b"\x89PNG\r\n\x1a\n":
+                                    shutil.copy2(args.docker_wikilogo, wiki_png_path)
+                                    print(f"🖼️ Copied custom wiki logo → {wiki_png_path}")
+                                else:
+                                    print(f"⚠️ Custom logo '{args.docker_wikilogo}' is not a valid PNG (magic mismatch). Generating dummy logo instead.")
+                                    ensure_dummy_png(wiki_png_path, color=(255, 255, 255, 255), size=(160, 160))
+                            except Exception as e:
+                                print(f"⚠️ Failed to verify logo file: {e}. Generating dummy logo instead.")
+                                ensure_dummy_png(wiki_png_path, color=(255, 255, 255, 255), size=(160, 160))
+                        else:
+                            # Fallback to dummy
+                            ensure_dummy_png(wiki_png_path, color=(255, 255, 255, 255), size=(160, 160))
+                            if args.docker_wikilogo:
+                                print(f"⚠️ Custom logo not found at {args.docker_wikilogo}, generated dummy instead.")
+                            else:
+                                print("✔ No custom logo specified; generated dummy PNG.")
+
+                    except Exception as e:
+                        print(f"⚠️ Failed to prepare wiki logo: {e}")
+
+                    print("🎉 Wiki build context initialized successfully.")
+
+
+
+                # --- User guidance about Docker usage --------------------------------
+                print("🧩  Docker usage note:")
+                print("   - To start the environment in the foreground (recommended for first run):")
+                print("       docker compose up")
+                print("   - To detach and run in the background (optional):")
+                print("       docker compose up -d")
+                print("")
+                print("💣  If you wish to completely reset your MediaWiki installation state")
+                print("    and destroy all volume data, use:")
+                print("       docker compose down -v")
+                print("    (This will wipe all wiki content, users, and the MariaDB volume.)")
+                print("")
+
+
+
             except Exception as e:
                 print(f"⚠️ Docker generation failed: {e}")
 
